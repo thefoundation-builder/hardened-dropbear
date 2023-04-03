@@ -1,0 +1,276 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - 'master'
+      - 'main'
+  schedule:
+    - cron: '0 0 * * 0'
+# Run weekly, at 00:00 on sunday
+#    tags:
+#      - 'v*.*.*'
+  pull_request:
+    branches:
+      - 'dev'
+      - 'testing'
+
+# permissions are needed if pushing to ghcr.io
+permissions:
+  packages: write
+
+env:
+  REGISTRY_GITHUB: ghcr.io
+  REGISTRY_DOCKER: index.docker.io
+  GH_IMAGE_NAME: ghcr.io/${{ github.repository }}
+  DH_IMAGE_NAME: index.docker.io/thefoundation
+  CI_REGISTRY_IMAGE: ghcr.io/${{ github.repository }}
+  QU_REGISTRY_IMAGE: quay.io/thefoundation/library:${{ github.event.repository.name }}
+ #QU_REGISTRY_IMAGE: quay.io/${{ github.repository }}/${{ github.event.repository.name }}
+  BUILDCACHE: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
+  #BUILDCACHE: ghcr.io/${{ github.repository_owner }}/buildcache
+  PLATFORMS: "linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64/v8"
+  #PLATFORMS: "linux/amd64"
+  PLATFORMS_ALPINE: "linux/386,linux/amd64,linux/arm/v6,linux/arm/v7,linux/arm64/v8"
+  #PLATFORMS: "linux/amd64,linux/arm64/v8"
+  #PLATFORMS: "linux/amd64,linux/arm64/v8"
+
+jobs:
+  # Push image to GitHub Packages.
+  # See also https://docs.docker.com/docker-hub/builds/
+  upstream:
+    runs-on: ubuntu-latest
+    container: quay.io/thefoundation/library:docker-with-buildx
+    environment: build
+    permissions:
+      packages: read
+      contents: read
+    ## ONLY on https://github.com/thefoundation/ -> push to the builder repo
+    if: github.repository_owner == 'TheFoundation'
+    steps:
+      - uses: actions/checkout@v3
+      - name: prep-downstream
+        run: |
+             mkdir downstream
+             tar cv . |md5sum |cut -d" " -f1 > downstream/.md5sum_of_tar
+             cp -aurv * .github downstream &
+             wait
+             (echo "# Builder FOR  https://github.com/${{ github.repository_owner }}/${{ github.event.repository.name }} ";echo ;cat README.md )> downstream/README.md
+#      - uses: cpina/github-action-push-to-another-repository@main
+      - uses: TheFoundation/github-action-push-to-another-repository@main
+        env:
+          SSH_DEPLOY_KEY: ${{ secrets.SYNC_PUSH_KEY }}
+#          API_TOKEN_GITHUB: ${{ secrets.API_TOKEN_GITHUB }}
+        with:
+          source-directory: 'downstream'
+          destination-github-username: 'thefoundation-builder'
+          destination-repository-name: 'hardened-dropbear-builder'
+          user-email: actions@github.com
+#          user-email: github@committing.8shield.net
+          target-branch: main
+  build-base:
+    runs-on: ubuntu-latest
+    container: ghcr.io/thefoundation-builder/docker-with-buildx:latest
+    env:
+      QUAY_PASS: ${{ secrets.QUAY_PASS }}
+      QUAY_USER: ${{ secrets.QUAY_USER }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      APT_HTTP_PROXY_URL: ${{ secrets.APT_HTTP_PROXY_URL }}
+
+    environment: push-dockerhub
+    permissions:
+      packages: write
+      contents: read
+    if: github.repository_owner == 'thefoundation-builder'
+    steps:
+      - name: Show sources and Targets
+        run: |
+              echo "BUILDCACHE: $BUILDCACHE"
+      - uses: actions/checkout@v3
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Available platforms
+        run: echo ${{ steps.buildx.outputs.platforms }}
+#      - name: Login to Docker Hub
+#        uses: docker/login-action@v2
+#        with:
+#          username: ${{ secrets.DOCKERHUB_USERNAME }}
+#          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: current images
+        run: docker image ls
+      - name: show steps
+        run: echo "pushing to $CI_REGISTRY_IMAGE cached by $BUILDCACHE"
+      - name: test build
+        run: bash -c "time bash _0.build.test.sh"
+      - name: show builds
+        run: ls -lh1 builds
+      - name: show release files
+        run: find|grep tar.gz |grep hardened-dropbear
+      - name: create artifacts
+        run: bash -c 'mkdir upload; cp $(find -maxdepth 1 |grep tar.gz |grep hardened-dropbear) upload'
+      - name: push artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: artifact-singlearch
+          path: upload/*gz
+          if-no-files-found: error # 'warn' or 'ignore' are also available, defaults to `warn`
+          retention-days: 2
+
+  build_matrix:
+    needs: build-base
+    strategy:
+      matrix:
+        os: [alpine, ubuntu-focal, ubuntu-bionic, ubuntu-jammy]
+        arch: [linux_SLASH_amd64,linux_SLASH_arm64,linux_SLASH_arm_SLASH_v7,linux_SLASH_s390x,linux_SLASH_ppc64le]
+        #arch: [linux_SLASH_amd64]
+        include:
+          - os: ubuntu-bionic
+            arch: linux_SLASH_386
+          - os: alpine
+            arch: linux_SLASH_386
+          - os: alpine
+            arch: linux_SLASH_arm_SLASH_v6
+#    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    container: ghcr.io/thefoundation-builder/docker-with-buildx:latest
+    env:
+      QUAY_PASS: ${{ secrets.QUAY_PASS }}
+      QUAY_USER: ${{ secrets.QUAY_USER }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      APT_HTTP_PROXY_URL: ${{ secrets.APT_HTTP_PROXY_URL }}
+
+    environment: push-dockerhub
+    permissions:
+      packages: write
+      contents: read
+    if: github.repository_owner == 'thefoundation-builder'
+    steps:
+      - name: Show sources and Targets
+        run: |
+              echo "BUILDCACHE: $BUILDCACHE"
+      - uses: actions/checkout@v3
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v2
+      - name: Available platforms
+        run: echo ${{ steps.buildx.outputs.platforms }}
+#      - name: Login to Docker Hub
+#        uses: docker/login-action@v2
+#        with:
+#          username: ${{ secrets.DOCKERHUB_USERNAME }}
+#          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: current images
+        run: docker image ls
+      - name: show steps
+        run: echo "pushing to $CI_REGISTRY_IMAGE cached by $BUILDCACHE WITH time bash _1.build.all.sh ${{ matrix.os }} ${{ matrix.arch }}"
+      - name: full build
+        run: bash -c "time bash _1.build.all.sh ${{ matrix.os }} ${{ matrix.arch }} " 
+      - name: show release files
+        run: find|grep tar.gz |grep hardened-dropbear
+      - name: create artifacts
+        run: bash -c 'mkdir upload; cp $(find -maxdepth 1 |grep tar.gz |grep hardened-dropbear) upload'
+      - name: push artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: artifact-${{ matrix.os }}-${{ matrix.arch }}
+          path: upload/*gz
+          if-no-files-found: ignore 
+          # 'error' 'warn' or 'ignore' are also available, defaults to `warn`
+          retention-days: 2
+
+  finish-release:
+    needs: build_matrix
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    container: ghcr.io/thefoundation-builder/docker-with-buildx:latest
+    if: github.repository_owner == 'thefoundation-builder'
+    steps:
+      - name: Download all workflow run artifacts
+        uses: actions/download-artifact@v3
+      - name: show artifacts
+        run: find -type f -name "*.gz"
+      - name: gather files
+        run: bash -c 'find -name "*.tar.gz" | while read file;do mv $file .;done'
+      - name: Generate release tag name
+        id: tag_name
+        run: echo "release_name=$(date +"%Y.%m.%d_%H-%M")" >> $GITHUB_OUTPUT
+      - name: Generate release tag
+        id: tag
+        run: echo "release_tag=v$(date +"%Y.%m.%d_%H-%M")" >> $GITHUB_OUTPUT
+      - name : create release file
+        run: (echo "## Hardened Dropbear a.k.a. Bouncing Dropbear";echo;echo "### Version ${{ steps.tag.outputs.release_tag }} "; echo "* The tar.gz files contain only the binaries an are generated from / ";echo "* Refer to github.com/${{ github.repository_owner }}/${{ github.event.repository.name }} for the source code ";echo "* The Docker images are at ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}  with only the binaries extracted , (g)libs might be missing" )  > RELEASE.md
+      - name: Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag:      ${{ steps.tag.outputs.release_tag }}
+          name: Hardened Dropbear ${{ steps.tag_name.outputs.release_name }}
+          artifacts: "hardened-dropbear-*.tar.gz"
+          bodyFile: "RELEASE.md"
+          repo: thefoundation/hardened-dropbear
+          token: ${{ secrets.RELEASE_TOKEN }}
+#      - name: Release
+#        uses: softprops/action-gh-release@v1
+#        #if: startsWith(github.ref, 'refs/tags/')
+#        with:
+#          name: ${{ steps.tag_name.outputs.release_name }}
+#          tag_name: ${{ steps.tag_name.outputs.release_name }}
+#          tag:      ${{ steps.tag.outputs.release_tag }}
+#          files: |
+#            RELEASE.md
+#            hardened-dropbear-*.tar.gz
+      - uses: geekyeggo/delete-artifact@v2
+        name: delete artifacts
+        with:
+            failOnError: false
+            name: |
+                artifact-*
+                release-*
+                output
+####      - name: show cmd
+######        run: sudo /bin/bash -c "export REGISTRY_PASSWORD=$REGISTRY_PASSWORD;export REGISTRY_HOST=docker.io;export REGISTRY_PROJECT=thefoundation;export PROJECT_NAME=hocker;export REGISTRY_USER=${{ secrets.REGISTRY_USER }} ;bash _build_hocker.sh base-focal "
+#####        run: echo docker buildx build --platform ${PLATFORMS}  --push --pull --cache-to=type=registry,ref=$BUILDCACHE:zzz_buildcache_${{ github.event.repository.name }} --cache-from=type=registry,ref=$BUILDCACHE:zzz_buildcache_${{ github.event.repository.name }} -t $CI_REGISTRY_IMAGE:latest  -f Dockerfile .
+#####
+#####      - name: build images
+######        run: sudo /bin/bash -c "export REGISTRY_PASSWORD=$REGISTRY_PASSWORD;export REGISTRY_HOST=docker.io;export REGISTRY_PROJECT=thefoundation;export PROJECT_NAME=library;export REGISTRY_USER=${{ secrets.REGISTRY_USER }} ;bash _build_hocker.sh base-focal "
+#####        run: docker buildx build --platform ${PLATFORMS}  --push --pull --cache-to=type=registry,ref=$BUILDCACHE:zzz_buildcache_${{ github.event.repository.name }} --cache-from=type=registry,ref=$BUILDCACHE:zzz_buildcache_${{ github.event.repository.name }} -t $CI_REGISTRY_IMAGE:latest  -f Dockerfile .
+#####      -
+#####        name: Login to Quay Container Registry
+#####        uses: docker/login-action@v2
+#####        with:
+#####          registry: quay.io
+#####          username: ${{ secrets.QUAY_USER }}
+#####          password: ${{ secrets.QUAY_PASS }}
+#####      - name: build images to quay
+######        run: sudo /bin/bash -c "export REGISTRY_PASSWORD=$QUAY_PASS;export REGISTRY_HOST=quay.io;export REGISTRY_PROJECT=thefoundation;export PROJECT_NAME=libary;export REGISTRY_USER=${{ secrets.QUAY_USER }} ;bash _build_hocker.sh base-focal "
+#####        run: docker buildx build --platform ${PLATFORMS}  --push --pull                                                                                             --cache-from=type=registry,ref=$BUILDCACHE:zzz_buildcache_${{ github.event.repository.name }} -t $QU_REGISTRY_IMAGE  -f Dockerfile .
+#####
+#####      - name: show files
+######        run: bash -c "ls buildlogs/  -lh1 ; tail -n 20 buildlogs/*"
+#####        run: docker image ls 
+#####      - name: Archive production artifacts
+#####        uses: actions/upload-artifact@v3
+#####        if: failure()
+#####        with:
+#####         name: buildlogs
+#####         path: |
+#####              buildlogs
